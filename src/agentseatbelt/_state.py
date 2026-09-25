@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .guard import _Run
 
-current: contextvars.ContextVar["_Run | None"] = contextvars.ContextVar("agentguard_run", default=None)
+current: contextvars.ContextVar["_Run | None"] = contextvars.ContextVar("agentseatbelt_run", default=None)
 active_runs: set["_Run"] = set()
 active_lock = threading.Lock()
 

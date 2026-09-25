@@ -98,7 +98,7 @@ class _Run:
         ev = Event(time.monotonic() - self.started, kind, detail)
         self.report.events.append(ev)
         if self.guard.verbose:
-            print(f"[agentguard {ev.t:7.2f}s] {kind}: {detail}", file=sys.stderr)
+            print(f"[agentseatbelt {ev.t:7.2f}s] {kind}: {detail}", file=sys.stderr)
         if self.guard.on_event:
             try:
                 self.guard.on_event(ev)
@@ -139,7 +139,7 @@ class _Run:
         self.event("blocked", what)
         if self.guard.stop_on_blocked:
             self._raise_stop(EndpointBlocked(f"Blocked: {what}"))
-        raise BlockedRequest(f"AgentGuard blocked {what}")
+        raise BlockedRequest(f"AgentSeatbelt blocked {what}")
 
     def _check_loop(self, fingerprint: str, label: str) -> None:
         g = self.guard
@@ -376,7 +376,7 @@ class Guard:
             raise TypeError("fn is async: use `await guard.arun(fn, ...)`")
         run = self._start()
         run.thread_id = threading.get_ident()
-        watchdog = threading.Thread(target=self._watch_sync, args=(run,), daemon=True, name="agentguard-watchdog")
+        watchdog = threading.Thread(target=self._watch_sync, args=(run,), daemon=True, name="agentseatbelt-watchdog")
         token = _state.current.set(run)
         output, error = None, None
         try:
@@ -470,7 +470,7 @@ class Guard:
     def _result(self, run: _Run, output: Any, report: RunReport, error: BaseException | None) -> GuardResult:
         if error is not None:
             try:
-                error.agentguard_report = report  # type: ignore[attr-defined]
+                error.agentseatbelt_report = report  # type: ignore[attr-defined]
             except Exception:
                 pass
             raise error

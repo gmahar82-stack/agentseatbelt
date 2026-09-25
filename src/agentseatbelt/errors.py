@@ -1,8 +1,8 @@
-"""Exceptions raised by AgentGuard."""
+"""Exceptions raised by AgentSeatbelt."""
 
 
 class GuardStop(BaseException):
-    """Raised inside the agent when AgentGuard stops the run.
+    """Raised inside the agent when AgentSeatbelt stops the run.
 
     Derives from BaseException (like KeyboardInterrupt) so agent code with a broad
     ``except Exception:`` can't swallow it and keep going.

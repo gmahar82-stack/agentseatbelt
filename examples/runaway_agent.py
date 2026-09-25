@@ -1,4 +1,4 @@
-"""Demo: a runaway agent using the real OpenAI SDK, stopped by AgentGuard.
+"""Demo: a runaway agent using the real OpenAI SDK, stopped by AgentSeatbelt.
 
 Runs offline against a tiny fake OpenAI-compatible server, so no API key or money is needed:
     pip install openai
@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from openai import OpenAI
 
-from agentguard import Guard
+from agentseatbelt import Guard
 
 
 class FakeOpenAI(BaseHTTPRequestHandler):

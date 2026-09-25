@@ -1,4 +1,4 @@
-"""AgentGuard: a seatbelt for AI agents.
+"""AgentSeatbelt: a seatbelt for AI agents.
 
 Budget caps, rate limits, time limits, loop detection, endpoint filters, an emergency stop and a
 cost report, for any agent that talks to its LLM and tools over HTTP (httpx or requests).

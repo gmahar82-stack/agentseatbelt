@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentguard"
+name = "agentseatbelt"
 version = "0.1.0"
 description = "A seatbelt for AI agents: budget caps, rate limits, time limits, loop detection and endpoint filters for any Python agent."
 readme = "README.md"
@@ -20,15 +20,15 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/gmahar82-stack/agentguard"
-Issues = "https://github.com/gmahar82-stack/agentguard/issues"
-Changelog = "https://github.com/gmahar82-stack/agentguard/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/gmahar82-stack/agentseatbelt"
+Issues = "https://github.com/gmahar82-stack/agentseatbelt/issues"
+Changelog = "https://github.com/gmahar82-stack/agentseatbelt/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx", "httpx2", "requests", "openai"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentguard"]
+packages = ["src/agentseatbelt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

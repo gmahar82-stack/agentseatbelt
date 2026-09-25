@@ -1,11 +1,11 @@
-# AgentGuard
+# AgentSeatbelt
 
 **A seatbelt for AI agents.** Budget caps, rate limits, time limits, loop detection, endpoint filters, an emergency stop and a cost report, for any Python agent, with no changes to your agent code.
 
-Agents go off the rails. They make 10,000 API calls when you expected 10, burn your API budget in an hour, loop forever, or call endpoints they shouldn't. AgentGuard wraps the run and stops it when it crosses a line you set.
+Agents go off the rails. They make 10,000 API calls when you expected 10, burn your API budget in an hour, loop forever, or call endpoints they shouldn't. AgentSeatbelt wraps the run and stops it when it crosses a line you set.
 
 ```python
-from agentguard import Guard
+from agentseatbelt import Guard
 
 guard = Guard(
     max_budget_usd=5.00,
@@ -21,7 +21,7 @@ print(result.report.summary())
 ```
 
 ```
-AgentGuard report: STOPPED (budget_exceeded)
+AgentSeatbelt report: STOPPED (budget_exceeded)
   Reason:    Budget of $5.00 reached ($5.0312 spent)
   Duration:  41.7s
   Cost:      $5.03
@@ -34,14 +34,14 @@ AgentGuard report: STOPPED (budget_exceeded)
 ## Install
 
 ```bash
-pip install agentguard
+pip install agentseatbelt
 ```
 
 No dependencies. Works on Python 3.10+.
 
 ## How it works
 
-AgentGuard hooks the HTTP libraries almost every Python agent uses underneath: **httpx** and its successor **httpx2** (used by the OpenAI, Anthropic, Groq, Mistral and most other SDKs; newer OpenAI SDKs use httpx2) and **requests**. Every call made inside `guard.run(...)` passes through the guard first. That means it works with **any framework**, including LangChain, CrewAI, LlamaIndex, the raw SDKs or your own code, without wrappers or config.
+AgentSeatbelt hooks the HTTP libraries almost every Python agent uses underneath: **httpx** and its successor **httpx2** (used by the OpenAI, Anthropic, Groq, Mistral and most other SDKs; newer OpenAI SDKs use httpx2) and **requests**. Every call made inside `guard.run(...)` passes through the guard first. That means it works with **any framework**, including LangChain, CrewAI, LlamaIndex, the raw SDKs or your own code, without wrappers or config.
 
 Outside a guarded run, nothing changes.
 
@@ -60,7 +60,7 @@ Outside a guarded run, nothing changes.
 | Cost report | `result.report` | Cost, tokens, models, hosts, the reason it stopped, and the last 200 events. |
 
 ### Stops can't be swallowed
-When a limit is hit, AgentGuard raises a `GuardStop` inside the agent. It derives from `BaseException` (like `KeyboardInterrupt`), so an agent with a careless `except Exception: retry` can't catch it and keep going. After a stop, every further request is refused.
+When a limit is hit, AgentSeatbelt raises a `GuardStop` inside the agent. It derives from `BaseException` (like `KeyboardInterrupt`), so an agent with a careless `except Exception: retry` can't catch it and keep going. After a stop, every further request is refused.
 
 ### Hard kill
 Time limits, emergency stops and budget overruns also interrupt the agent's thread directly, so an agent spinning in a local loop (no HTTP calls) is stopped too. Code stuck inside a single blocking C call (e.g. a socket read with no timeout) stops as soon as that call returns. Async agents are cancelled. Disable with `hard_kill=False`.
@@ -77,7 +77,7 @@ A blocked call raises `BlockedRequest` (a normal `Exception`, so the agent can r
 
 Usage is read from OpenAI-compatible APIs (OpenAI, Groq, Together, OpenRouter and others), the OpenAI Responses API, Anthropic and Gemini. If a gateway reports the real cost (OpenRouter's `usage.cost`), that is used.
 
-Prices are **your responsibility to verify**. A small default table ships in `agentguard.DEFAULT_PRICES`, but prices change, so override them:
+Prices are **your responsibility to verify**. A small default table ships in `agentseatbelt.DEFAULT_PRICES`, but prices change, so override them:
 
 ```python
 Guard(max_budget_usd=5, pricing={"gpt-4o": (2.50, 10.00), "my-model": (0.20, 0.80)})  # USD per 1M tokens (in, out)

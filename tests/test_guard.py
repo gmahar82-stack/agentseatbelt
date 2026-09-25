@@ -8,7 +8,7 @@ import httpx
 import pytest
 import requests
 
-from agentguard import (
+from agentseatbelt import (
     BlockedRequest,
     BudgetExceeded,
     Guard,
@@ -332,7 +332,7 @@ def test_agent_errors_propagate_with_report():
 
     with pytest.raises(ValueError) as info:
         Guard().run(broken)
-    assert info.value.agentguard_report.status == "error"
+    assert info.value.agentseatbelt_report.status == "error"
 
 
 def test_raise_on_stop():

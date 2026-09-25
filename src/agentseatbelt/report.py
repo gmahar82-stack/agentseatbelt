@@ -22,7 +22,7 @@ def _money(usd: float) -> str:
 @dataclass
 class RunReport:
     status: str = "running"  # completed | stopped | error
-    stop_reason: str | None = None  # e.g. "budget_exceeded"; see agentguard.errors
+    stop_reason: str | None = None  # e.g. "budget_exceeded"; see agentseatbelt.errors
     message: str = ""
     duration_s: float = 0.0
     cost_usd: float = 0.0
@@ -46,7 +46,7 @@ class RunReport:
 
     def summary(self) -> str:
         head = self.status.upper() + (f" ({self.stop_reason})" if self.stop_reason else "")
-        lines = [f"AgentGuard report: {head}"]
+        lines = [f"AgentSeatbelt report: {head}"]
         if self.message:
             lines.append(f"  Reason:    {self.message}")
         if self.error:
