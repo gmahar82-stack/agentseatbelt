@@ -1,6 +1,6 @@
 # AgentSeatbelt
 
-**A seatbelt for AI agents.** Budget caps, rate limits, time limits, loop detection, endpoint filters, an emergency stop and a cost report, for any Python agent, with no changes to your agent code.
+**A seatbelt for AI agents.** Budget caps, rate limits, time limits, loop detection, endpoint filters, x402 payment limits, an emergency stop and a cost report, for any Python agent, with no changes to your agent code.
 
 Agents go off the rails. They make 10,000 API calls when you expected 10, burn your API budget in an hour, loop forever, or call endpoints they shouldn't. AgentSeatbelt wraps the run and stops it when it crosses a line you set.
 
@@ -57,7 +57,8 @@ Outside a guarded run, nothing changes.
 | Endpoint filter | `block_endpoints=[...]`, `allow_endpoints=[...]` | Blocked calls never leave your machine. |
 | Action filter | `block_actions=["delete_*"]` | For tool calls reported via `guard.checkpoint(...)`. |
 | Emergency stop | `guard.stop()` or `kill_file="STOP"` | Stop from another thread, or by creating a file. |
-| Cost report | `result.report` | Cost, tokens, models, hosts, the reason it stopped, and the last 200 events. |
+| Payment limits | `max_payment_usd=0.05`, `pay_safe=True` | x402 payments count toward the budget, capped per payment, optionally checked by Pay Safe. See [x402 payments](#x402-payments-agents-that-pay-for-apis). |
+| Cost report | `result.report` | Cost, tokens, models, payments, hosts, the reason it stopped, and the last 200 events. |
 
 ### Stops can't be swallowed
 When a limit is hit, AgentSeatbelt raises a `GuardStop` inside the agent. It derives from `BaseException` (like `KeyboardInterrupt`), so an agent with a careless `except Exception: retry` can't catch it and keep going. After a stop, every further request is refused.
@@ -72,6 +73,50 @@ Time limits, emergency stops and budget overruns also interrupt the agent's thre
 - `"*.example.com"`, `"*/admin/*"`: globs
 
 A blocked call raises `BlockedRequest` (a normal `Exception`, so the agent can recover and try something else). Pass `stop_on_blocked=True` to end the run instead.
+
+## x402 payments (agents that pay for APIs)
+
+Agents increasingly pay for APIs themselves with [x402](https://www.x402.org): a service answers `402 Payment Required`, and the agent's x402 client resends the request with a signed USDC payment. AgentSeatbelt reads that signed payment **before it leaves your machine**:
+
+```python
+guard = Guard(
+    max_budget_usd=2.00,     # LLM costs + x402 payments together
+    max_payment_usd=0.05,    # no single payment above 5 cents
+    pay_safe=True,           # optional: check each payment with Pay Safe first (see below)
+)
+result = guard.run(my_paying_agent)
+print(result.report.summary())
+```
+
+```
+AgentSeatbelt report: COMPLETED
+  Cost:      $0.4120
+  Requests:  58 (LLM calls: 40, blocked: 1)
+  Payments:  17 x402 ($0.0340), blocked: 1, Pay Safe checks: 12
+```
+
+- **Payments count toward `max_budget_usd`** (USDC, from the payment itself). A payment that would cross the budget is never sent.
+- **`max_payment_usd`** blocks any single payment above the cap. Payments in other assets are blocked too when a cap is set, because their dollar value is unknown.
+- **Failed calls aren't counted**: a payment only counts when the service accepted it.
+- A blocked payment raises **`PaymentBlocked`** (a normal `Exception`, so the agent can recover). The signed payment is never delivered, so **nothing is paid**. Some x402 clients wrap it in their own error; the original is its `__cause__`.
+- Works with x402 v1 and v2, and with clients that resend the paid request inside their own transport, such as Coinbase's `x402` package (`wrapHttpxWithPayment`, `wrapRequestsWithPayment`).
+
+### Pay Safe (optional, off by default)
+
+With `pay_safe=True`, each payment is checked by [Pay Safe](https://agent-deals.gm-tools.workers.dev/trust) before it's sent, and blocked when the answer is **STOP**:
+
+- **Is the service working?** It's monitored continuously across ~25,000 paid agent APIs.
+- **Is the price fair?** It compares the price against the service's own listing, what it charged before, and similar services.
+- **Is the wallet safe?** It checks scam lists and burn addresses, and whether this is the same wallet the service normally uses. A different wallet can mean a tampered payment request.
+
+| Option | Default | |
+|---|---|---|
+| `pay_safe_block` | `"stop"` | `"caution"` also blocks CAUTION answers |
+| `pay_safe_fail_closed` | `False` | If Pay Safe can't be reached, payments go through (`True` blocks them) |
+| `pay_safe_timeout` | `8.0` | Seconds |
+| `pay_safe_url` | Pay Safe's public endpoint | Point it at your own service if you prefer |
+
+**What is sent:** the service URL and the payment terms (amount, asset, network, pay-to wallet). **Never** the signature, your wallet key or your request content. Answers are cached for a minute, and the check is free. Pay Safe is run by the author of AgentSeatbelt; its accuracy tests are [published](https://agent-deals.gm-tools.workers.dev/trust).
 
 ## Cost tracking
 
@@ -110,11 +155,12 @@ Guard(verbose=True)                              # print every event to stderr
 Guard(on_event=lambda e: send_to_dashboard(e))   # or handle events yourself
 ```
 
-## Known limits (v0.1)
+## Known limits
 
 - **Streamed LLM responses aren't costed automatically.** They're counted in `report.untracked_streams`. Use non-streaming calls, or `guard.add_cost(...)`.
-- Only `httpx`, `httpx2` and `requests` are intercepted. `aiohttp`, `urllib` and subprocesses aren't seen.
-- The budget is checked **before** each call, so the call that crosses the limit still completes. The overshoot is at most one call.
+- Only `httpx`, `httpx2` and `requests` are intercepted. `aiohttp`, `urllib` and subprocesses aren't seen, and neither are payments sent some other way (e.g. an on-chain transfer made directly by the agent's wallet).
+- The budget is checked **before** each call, so an LLM call that crosses the limit still completes (the overshoot is at most one call). x402 payments are known in advance, so a payment that would cross it is never sent.
+- Payments are valued in dollars only for USDC.
 - Worker threads started by the agent are attributed to the run when exactly one guarded run is active in the process.
 - Budgets are based on token counts and your price table. They're an estimate, not your provider's invoice.
 

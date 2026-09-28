@@ -17,7 +17,7 @@ from fnmatch import fnmatch
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
-from . import _state, interceptors
+from . import _state, interceptors, payments
 from .errors import (
     BlockedRequest,
     BudgetExceeded,
@@ -25,16 +25,19 @@ from .errors import (
     EndpointBlocked,
     GuardStop,
     LoopDetected,
+    PaymentBlocked,
     RateLimitExceeded,
     RequestLimitExceeded,
     TimeLimitExceeded,
 )
+from .payments import Payment
 from .pricing import DEFAULT_PRICES, FALLBACK_PRICE, estimate_cost, extract_usage
 from .report import Event, RunReport
 
 MAX_JSON_BYTES = 5 * 1024 * 1024
 FINGERPRINT_BODY_BYTES = 64 * 1024
 WATCH_INTERVAL_S = 0.2
+PAY_SAFE_CACHE_S = 60.0  # the same payment to the same service isn't re-checked within a minute
 
 
 @dataclass
@@ -91,6 +94,9 @@ class _Run:
         self.in_agent = False
         self.needs_kill = False
         self.task: asyncio.Task | None = None
+        # x402: payment options from 402 answers (by URL), and recent Pay Safe answers.
+        self.quotes: dict[str, list[dict]] = {}
+        self.pay_safe_answers: dict[tuple, tuple[float, dict]] = {}
 
     # ---- events and stopping -------------------------------------------------------------
 
@@ -202,8 +208,116 @@ class _Run:
                 self.event("action", target)
             return 0.0
 
-    def record_response(self, url: str, request_body: bytes, content_type: str, body: bytes | None, streamed: bool) -> None:
+    # ---- x402 payments -------------------------------------------------------------------
+
+    def _block_payment(self, payment: Payment, why: str, verdict: dict | None = None) -> None:
+        self.report.blocked += 1
+        self.report.payments_blocked += 1
+        what = f"payment of {payment.describe()}: {why}"
+        self.event("blocked", what)
+        if self.guard.stop_on_blocked:
+            self._raise_stop(EndpointBlocked(f"Blocked {what}"))
+        raise PaymentBlocked(f"AgentSeatbelt blocked a {what}", verdict)
+
+    def check_payment(self, method: str, url: str, headers) -> Payment | None:
+        """Called before a request leaves. If it carries a signed x402 payment, apply the payment cap,
+        the budget and (if enabled) Pay Safe. Raises PaymentBlocked or GuardStop to keep it from being sent."""
         g = self.guard
+        with self.lock:
+            payment = payments.parse_payment(headers, self.quotes.get(url))
+            if payment is None:
+                return None
+            usd = payment.amount_usd
+            if g.max_payment_usd is not None:
+                if usd is None:
+                    self._block_payment(payment, "its dollar value is unknown (not USDC), so max_payment_usd can't be applied")
+                if usd > g.max_payment_usd:
+                    self._block_payment(payment, f"above max_payment_usd (${g.max_payment_usd:g})")
+            if g.max_budget_usd is not None and usd is not None and self.report.cost_usd + usd > g.max_budget_usd:
+                self._raise_stop(
+                    BudgetExceeded(
+                        f"Paying ${usd:.6g} would exceed the budget of ${g.max_budget_usd:.2f} "
+                        f"(${self.report.cost_usd:.4f} spent)"
+                    )
+                )
+        if g.pay_safe:
+            self._pay_safe(method, url, payment)
+        return payment
+
+    def _pay_safe(self, method: str, url: str, payment: Payment) -> None:
+        g = self.guard
+        key = (url, str(payment.pay_to).lower(), payment.raw_amount, payment.asset)
+        now = time.monotonic()
+        with self.lock:
+            cached = self.pay_safe_answers.get(key)
+        if cached and now - cached[0] < PAY_SAFE_CACHE_S:
+            answer = cached[1]
+        else:
+            try:  # outside the lock: other threads keep working while this one waits
+                answer = payments.pay_safe(url, method, payment, g.pay_safe_url, g.pay_safe_timeout)
+            except (OSError, ValueError) as e:
+                with self.lock:
+                    self.event("pay_safe", f"check unavailable ({type(e).__name__}) for {payment.describe()}")
+                    if g.pay_safe_fail_closed:
+                        self._block_payment(payment, "Pay Safe couldn't be reached (pay_safe_fail_closed=True)")
+                return
+            with self.lock:
+                self.pay_safe_answers[key] = (now, answer)
+        with self.lock:
+            self.report.pay_safe_checks += 1
+            verdict = answer["verdict"]
+            self.event("pay_safe", f"{verdict.upper()} for {payment.describe()}: {answer.get('summary', '')}")
+            if verdict == "stop" or (verdict == "caution" and g.pay_safe_block == "caution"):
+                self._block_payment(payment, f"Pay Safe says {verdict.upper()}: {answer.get('summary', '')}", answer)
+
+    def record_payment(self, url: str, status: int, headers, payment: Payment | None) -> None:
+        """After a response: remember 402 payment options, and count a payment that went through."""
+        if status == 402:
+            quotes = payments.parse_quote(headers, None)
+            if quotes:
+                with self.lock:
+                    self.quotes[url] = quotes
+        if payment is None:
+            return
+        g = self.guard
+        with self.lock:
+            r = self.report
+            if not (payments.settled(headers) or 200 <= status < 300):
+                self.event("payment", f"not charged (HTTP {status}): {payment.describe()}")
+                return
+            r.payments += 1
+            host = urlsplit(url).hostname or "?"
+            usd = payment.amount_usd
+            if usd is None:
+                r.unvalued_payments += 1
+                self.event("payment", f"paid {payment.describe()} to {host} (not valued in USD, not in the budget)")
+                return
+            r.payments_usd += usd
+            r.cost_usd += usd
+            self.event("payment", f"paid ${usd:.6g} to {host} (payments ${r.payments_usd:.4f}, total ${r.cost_usd:.4f})")
+            if g.max_budget_usd is not None and r.cost_usd >= g.max_budget_usd:
+                self.mark_stop(BudgetExceeded(f"Budget of ${g.max_budget_usd:.2f} reached (${r.cost_usd:.4f} spent)"))
+
+    def record_response(
+        self,
+        url: str,
+        request_body: bytes,
+        content_type: str,
+        body: bytes | None,
+        streamed: bool,
+        status: int = 200,
+        headers=None,
+        payment: Payment | None = None,
+    ) -> None:
+        g = self.guard
+        if headers is not None:
+            if status == 402 and not headers.get("payment-required"):
+                # x402 v1 puts the payment options in the JSON body instead of a header.
+                quotes = payments.parse_quote({}, _parse_json(body, content_type))
+                if quotes:
+                    with self.lock:
+                        self.quotes[url] = quotes
+            self.record_payment(url, status, headers, payment)
         request_json = _parse_json(request_body)
         if streamed:
             if isinstance(request_json, dict) and "model" in request_json:
@@ -319,11 +433,18 @@ class Guard:
         verbose: bool = False,
         on_event: Callable[[Event], None] | None = None,
         rate_window_seconds: float = 60.0,
+        max_payment_usd: float | None = None,
+        pay_safe: bool = False,
+        pay_safe_block: str = "stop",
+        pay_safe_fail_closed: bool = False,
+        pay_safe_url: str = payments.PAY_SAFE_URL,
+        pay_safe_timeout: float = 8.0,
     ):
         """
         Args:
-            max_budget_usd: Stop when the estimated LLM cost reaches this. Checked before each call,
-                so the call that crosses the limit still completes.
+            max_budget_usd: Stop when the estimated LLM cost plus x402 payments reach this. Checked before
+                each call, so an LLM call that crosses the limit still completes; a payment that would cross
+                it is never sent.
             max_requests: Stop after this many HTTP requests.
             max_requests_per_minute: Rate limit; see ``on_rate_limit``.
             max_runtime_seconds: Stop after this long, even mid-loop (see ``hard_kill``).
@@ -342,9 +463,21 @@ class Guard:
             raise_on_stop: Re-raise the GuardStop from run() instead of returning a result.
             verbose: Print every event to stderr.
             on_event: Callback receiving each Event (live monitoring).
+            max_payment_usd: Block any single x402 payment above this (USDC). Payments in other assets
+                are blocked too when this is set, since their dollar value is unknown.
+            pay_safe: Before each x402 payment is sent, ask the Pay Safe service whether it looks safe: is
+                the service working, is the price fair, is the wallet safe and the one the service normally
+                uses. Sends the service URL and the payment terms (amount, asset, network, pay-to wallet),
+                never the signature or any key. Off by default.
+            pay_safe_block: "stop" (default) blocks payments Pay Safe rates STOP; "caution" also blocks CAUTION.
+            pay_safe_fail_closed: Block payments when Pay Safe can't be reached (default: let them through).
+            pay_safe_url: The Pay Safe endpoint.
+            pay_safe_timeout: Seconds to wait for Pay Safe.
         """
         if on_rate_limit not in ("wait", "stop"):
             raise ValueError('on_rate_limit must be "wait" or "stop"')
+        if pay_safe_block not in ("stop", "caution"):
+            raise ValueError('pay_safe_block must be "stop" or "caution"')
         self.max_budget_usd = max_budget_usd
         self.max_requests = max_requests
         self.max_requests_per_minute = max_requests_per_minute
@@ -364,6 +497,12 @@ class Guard:
         self.verbose = verbose
         self.on_event = on_event
         self.rate_window_seconds = rate_window_seconds
+        self.max_payment_usd = max_payment_usd
+        self.pay_safe = pay_safe
+        self.pay_safe_block = pay_safe_block
+        self.pay_safe_fail_closed = pay_safe_fail_closed
+        self.pay_safe_url = pay_safe_url
+        self.pay_safe_timeout = pay_safe_timeout
         self.last_report: RunReport | None = None
         self._runs: set[_Run] = set()
         self._runs_lock = threading.Lock()

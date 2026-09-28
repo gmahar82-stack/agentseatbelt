@@ -11,7 +11,7 @@ MAX_EVENTS = 200
 @dataclass
 class Event:
     t: float  # seconds since the run started
-    kind: str  # request | llm | action | blocked | wait | stop | note
+    kind: str  # request | llm | payment | pay_safe | action | blocked | wait | stop | note
     detail: str
 
 
@@ -35,6 +35,11 @@ class RunReport:
     rate_limit_waits: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    payments: int = 0  # x402 payments that went through
+    payments_usd: float = 0.0  # their USDC value (also included in cost_usd)
+    payments_blocked: int = 0  # payments stopped before they were sent
+    unvalued_payments: int = 0  # payments in assets other than USDC (not in the budget)
+    pay_safe_checks: int = 0
     hosts: Counter = field(default_factory=Counter)
     models: Counter = field(default_factory=Counter)
     events: deque = field(default_factory=lambda: deque(maxlen=MAX_EVENTS))
@@ -66,6 +71,14 @@ class RunReport:
         lines.append(f"  Requests:  {self.requests} ({', '.join(parts)})")
         if self.input_tokens or self.output_tokens:
             lines.append(f"  Tokens:    {self.input_tokens:,} in / {self.output_tokens:,} out")
+        if self.payments or self.payments_blocked:
+            line = f"  Payments:  {self.payments} x402 ({_money(self.payments_usd)})"
+            extra = [f"blocked: {self.payments_blocked}"] if self.payments_blocked else []
+            if self.unvalued_payments:
+                extra.append(f"{self.unvalued_payments} not in USDC, not costed")
+            if self.pay_safe_checks:
+                extra.append(f"Pay Safe checks: {self.pay_safe_checks}")
+            lines.append(line + (f", {', '.join(extra)}" if extra else ""))
         if self.models:
             lines.append("  Models:    " + ", ".join(f"{m} ({n})" for m, n in self.models.most_common(5)))
         if self.hosts:
@@ -88,6 +101,11 @@ class RunReport:
             "rate_limit_waits": self.rate_limit_waits,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "payments": self.payments,
+            "payments_usd": round(self.payments_usd, 6),
+            "payments_blocked": self.payments_blocked,
+            "unvalued_payments": self.unvalued_payments,
+            "pay_safe_checks": self.pay_safe_checks,
             "hosts": dict(self.hosts),
             "models": dict(self.models),
             "events": [{"t": round(e.t, 3), "kind": e.kind, "detail": e.detail} for e in self.events],

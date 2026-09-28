@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentseatbelt"
-version = "0.1.0"
-description = "A seatbelt for AI agents: budget caps, rate limits, time limits, loop detection and endpoint filters for any Python agent."
+version = "0.2.0"
+description = "A seatbelt for AI agents: budget caps, rate limits, time limits, loop detection, endpoint filters and x402 payment limits for any Python agent."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = []
 authors = [{ name = "gmahar82-stack" }]
-keywords =["ai", "agents", "llm", "budget", "rate-limit", "safety", "openai", "anthropic", "groq"]
+keywords =["ai", "agents", "llm", "budget", "rate-limit", "safety", "openai", "anthropic", "groq", "x402", "payments", "usdc"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -25,7 +25,7 @@ Issues = "https://github.com/gmahar82-stack/agentseatbelt/issues"
 Changelog = "https://github.com/gmahar82-stack/agentseatbelt/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "httpx2", "requests", "openai"]
+dev = ["pytest", "httpx", "httpx2", "requests", "openai", "x402[evm,clients]"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentseatbelt"]

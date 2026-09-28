@@ -63,3 +63,15 @@ class BlockedRequest(Exception):
     A normal Exception, so the agent can catch it and try something else.
     Pass ``stop_on_blocked=True`` to stop the whole run instead.
     """
+
+
+class PaymentBlocked(BlockedRequest):
+    """An x402 payment was blocked before it was sent (payment cap, or Pay Safe said stop).
+
+    Nothing was paid: the signed payment never left the machine. ``verdict`` holds Pay Safe's answer
+    when it was the reason.
+    """
+
+    def __init__(self, message: str = "", verdict: dict | None = None):
+        super().__init__(message)
+        self.verdict = verdict
