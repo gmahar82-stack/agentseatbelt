@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Quick feedback form (no GitHub account needed)
+    url: https://agent-deals.gm-tools.workers.dev/trust#fb
+    about: Report a wrong answer, a bug or an idea in 10 seconds.
+  - name: Accuracy results and live status
+    url: https://agent-deals.gm-tools.workers.dev/trust
+    about: Published accuracy tests for Pay Safe and Trust Check.

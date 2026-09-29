@@ -1,0 +1,22 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: A minimal code example, if possible. Never paste private keys or seed phrases.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Package version and runtime
+      placeholder: e.g. 0.2.0, Python 3.12 / Node 22

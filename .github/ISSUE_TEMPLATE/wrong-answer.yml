@@ -1,0 +1,23 @@
+name: Wrong Pay Safe or Trust Check answer
+description: A payment or token was judged wrongly (false alarm, missed scam, wrong price)
+labels: [wrong-answer]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of mistake?
+      options: [False alarm, Missed a scam, Wrong price, Other]
+    validations:
+      required: true
+  - type: input
+    id: subject
+    attributes:
+      label: Service URL, token or address
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What was the answer, and what should it have been?
+    validations:
+      required: true
