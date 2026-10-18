@@ -125,6 +125,11 @@ def has_payment(headers: Mapping[str, str]) -> bool:
     return any(headers.get(h) for h in PAYMENT_HEADERS)
 
 
+def payment_header(headers: Mapping[str, str]) -> str | None:
+    """The signed payment exactly as sent: the same value means the same payment."""
+    return next((headers.get(h) for h in PAYMENT_HEADERS if headers.get(h)), None)
+
+
 def settled(headers: Mapping[str, str]) -> bool:
     return any(headers.get(h) for h in RESPONSE_HEADERS)
 

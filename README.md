@@ -101,6 +101,16 @@ AgentSeatbelt report: COMPLETED
 - A blocked payment raises **`PaymentBlocked`** (a normal `Exception`, so the agent can recover). The signed payment is never delivered, so **nothing is paid**. Some x402 clients wrap it in their own error; the original is its `__cause__`.
 - Works with x402 v1 and v2, and with clients that resend the paid request inside their own transport, such as Coinbase's `x402` package (`wrapHttpxWithPayment`, `wrapRequestsWithPayment`).
 
+### Lost answers: resend, never re-sign
+
+If a signed payment gets no answer (connection reset, timeout, or a 502/503/504/52x gateway error), the seller may still have settled it. Signing a new payment then could pay twice. So the guard:
+
+1. Resends the **same** signed payment (up to `lost_answer_retries` times, default 2, waiting `lost_answer_retry_delay` seconds times the attempt number). A signed payment can be settled only once, so this is safe.
+2. If there's still no answer, marks the payment **unconfirmed**: it keeps counting against `max_budget_usd`, is listed in `report.unconfirmed` / `report.unconfirmed_usd` (and flagged in the summary), and a **new** signed payment for the same request raises `PaymentBlocked`. Resending the same signed payment is still allowed. `block_new_payment_while_unconfirmed=False` turns the block off.
+3. Once you know (from your wallet or a block explorer), call `guard.resolve_unconfirmed(url, charged=True/False)` inside the run.
+
+Streamed request bodies can't be resent, so those go straight to step 2. Thanks to MusedIn for pointing this case out.
+
 ### Pay Safe (optional, off by default)
 
 With `pay_safe=True`, each payment is checked by [Pay Safe](https://agent-deals.gm-tools.workers.dev/trust) before it's sent, and blocked when the answer is **STOP**:

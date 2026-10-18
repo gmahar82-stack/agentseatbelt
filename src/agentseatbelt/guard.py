@@ -38,6 +38,8 @@ MAX_JSON_BYTES = 5 * 1024 * 1024
 FINGERPRINT_BODY_BYTES = 64 * 1024
 WATCH_INTERVAL_S = 0.2
 PAY_SAFE_CACHE_S = 60.0  # the same payment to the same service isn't re-checked within a minute
+# Gateway errors: the seller's server may have settled the payment before the answer was lost.
+LOST_ANSWER_STATUSES = frozenset({502, 503, 504, 520, 521, 522, 523, 524})
 
 
 @dataclass
@@ -97,6 +99,8 @@ class _Run:
         # x402: payment options from 402 answers (by URL), and recent Pay Safe answers.
         self.quotes: dict[str, list[dict]] = {}
         self.pay_safe_answers: dict[tuple, tuple[float, dict]] = {}
+        # Payments whose answer was lost, by the signed payment exactly as it was sent.
+        self.unconfirmed: dict[str, dict] = {}
 
     # ---- events and stopping -------------------------------------------------------------
 
@@ -227,17 +231,29 @@ class _Run:
             payment = payments.parse_payment(headers, self.quotes.get(url))
             if payment is None:
                 return None
+            # The same signed payment sent again after a lost answer is already counted: it can't be charged twice.
+            key = f"{method.upper()} {url}"
+            earlier = self.unconfirmed.get(payments.payment_header(headers) or "")
+            if earlier and earlier["key"] == key:
+                return earlier["payment"]
+            if g.block_new_payment_while_unconfirmed and any(e["key"] == key for e in self.unconfirmed.values()):
+                self._block_payment(
+                    payment,
+                    "an earlier payment for this request got no answer and may already have been charged. Resend that "
+                    "same signed payment, or call guard.resolve_unconfirmed() once you know whether it was charged",
+                )
             usd = payment.amount_usd
             if g.max_payment_usd is not None:
                 if usd is None:
                     self._block_payment(payment, "its dollar value is unknown (not USDC), so max_payment_usd can't be applied")
                 if usd > g.max_payment_usd:
                     self._block_payment(payment, f"above max_payment_usd (${g.max_payment_usd:g})")
-            if g.max_budget_usd is not None and usd is not None and self.report.cost_usd + usd > g.max_budget_usd:
+            committed = self.report.cost_usd + self.report.unconfirmed_usd
+            if g.max_budget_usd is not None and usd is not None and committed + usd > g.max_budget_usd:
                 self._raise_stop(
                     BudgetExceeded(
                         f"Paying ${usd:.6g} would exceed the budget of ${g.max_budget_usd:.2f} "
-                        f"(${self.report.cost_usd:.4f} spent)"
+                        f"(${self.report.cost_usd:.4f} spent, ${self.report.unconfirmed_usd:.4f} unconfirmed)"
                     )
                 )
         if g.pay_safe:
@@ -270,7 +286,124 @@ class _Run:
             if verdict == "stop" or (verdict == "caution" and g.pay_safe_block == "caution"):
                 self._block_payment(payment, f"Pay Safe says {verdict.upper()}: {answer.get('summary', '')}", answer)
 
-    def record_payment(self, url: str, status: int, headers, payment: Payment | None) -> None:
+    # ---- lost answers: resend the same signed payment, never sign a new one -------------------
+
+    def _sent(self, method: str, url: str, headers) -> dict:
+        key = f"{method.upper()} {url}"
+        signature = payments.payment_header(headers) or ""
+        with self.lock:
+            earlier = self.unconfirmed.get(signature)
+        resend = bool(earlier and earlier["key"] == key)
+        return {"key": key, "method": method.upper(), "signature": signature, "resend": resend, "answer_lost": resend}
+
+    def _resending(self, payment: Payment, sent: dict, why: str, attempt: int, retries: int) -> float:
+        sent["answer_lost"] = True
+        with self.lock:
+            self.event("resend", f"{why}; resending the same signed payment ({attempt + 1}/{retries}): {payment.describe()}")
+        return self.guard.lost_answer_retry_delay * (attempt + 1)
+
+    def _sync_unconfirmed(self) -> None:
+        self.report.unconfirmed = [
+            {"url": e["url"], "method": e["method"], "amount_usd": e["payment"].amount_usd,
+             "pay_to": e["payment"].pay_to, "network": e["payment"].network, "why": e["why"]}
+            for e in self.unconfirmed.values()
+        ]
+
+    def mark_unconfirmed(self, url: str, payment: Payment, sent: dict, why: str) -> None:
+        """No answer: the payment may have been charged, so it keeps counting against the budget."""
+        with self.lock:
+            if not sent["resend"] and sent["signature"] not in self.unconfirmed:
+                self.unconfirmed[sent["signature"]] = {
+                    "key": sent["key"], "url": url, "method": sent["method"], "payment": payment, "why": why,
+                }
+                if payment.amount_usd is not None:
+                    self.report.unconfirmed_usd += payment.amount_usd
+                self._sync_unconfirmed()
+            self.event(
+                "unconfirmed",
+                f"{why}: {payment.describe()} may or may not have been charged. It still counts against the budget; "
+                "resend the same signed payment or call guard.resolve_unconfirmed()",
+            )
+
+    @staticmethod
+    def _lost(response) -> bool:
+        return response.status_code in LOST_ANSWER_STATUSES and not payments.settled(response.headers)
+
+    def send_payment(self, method: str, url: str, headers, payment: Payment, send, network_errors, can_resend: bool, close=None):
+        """Send a request carrying a signed payment, and count it. A lost answer (network error, timeout, gateway
+        error) is retried by resending the SAME signed payment, which can be settled at most once."""
+        sent = self._sent(method, url, headers)
+        retries = max(0, self.guard.lost_answer_retries) if can_resend else 0
+        attempt = 0
+        while True:
+            try:
+                response = send()
+            except network_errors as e:
+                why = f"no answer ({type(e).__name__})"
+                if attempt < retries:
+                    time.sleep(self._resending(payment, sent, why, attempt, retries))
+                    attempt += 1
+                    continue
+                self.mark_unconfirmed(url, payment, sent, why)
+                raise
+            if self._lost(response):
+                if attempt < retries:
+                    if close:
+                        close(response)
+                    time.sleep(self._resending(payment, sent, f"HTTP {response.status_code}", attempt, retries))
+                    attempt += 1
+                    continue
+                self.mark_unconfirmed(url, payment, sent, f"HTTP {response.status_code}")
+                return response
+            self.record_payment(url, response.status_code, response.headers, payment, sent)
+            return response
+
+    async def asend_payment(self, method: str, url: str, headers, payment: Payment, send, network_errors, can_resend: bool, close=None):
+        """``send_payment`` for async code: ``send`` returns an awaitable, ``close`` may too."""
+        sent = self._sent(method, url, headers)
+        retries = max(0, self.guard.lost_answer_retries) if can_resend else 0
+        attempt = 0
+        while True:
+            try:
+                response = await send()
+            except network_errors as e:
+                why = f"no answer ({type(e).__name__})"
+                if attempt < retries:
+                    await asyncio.sleep(self._resending(payment, sent, why, attempt, retries))
+                    attempt += 1
+                    continue
+                self.mark_unconfirmed(url, payment, sent, why)
+                raise
+            if self._lost(response):
+                if attempt < retries:
+                    if close:
+                        await close(response)
+                    await asyncio.sleep(self._resending(payment, sent, f"HTTP {response.status_code}", attempt, retries))
+                    attempt += 1
+                    continue
+                self.mark_unconfirmed(url, payment, sent, f"HTTP {response.status_code}")
+                return response
+            self.record_payment(url, response.status_code, response.headers, payment, sent)
+            return response
+
+    def resolve_unconfirmed(self, url: str, charged: bool, method: str = "GET") -> bool:
+        key = f"{method.upper()} {url}"
+        with self.lock:
+            signature = next((s for s, e in self.unconfirmed.items() if e["key"] == key), None)
+            if signature is None:
+                return False
+            entry = self.unconfirmed.pop(signature)
+            payment, r = entry["payment"], self.report
+            if payment.amount_usd is not None:
+                r.unconfirmed_usd -= payment.amount_usd
+            self._sync_unconfirmed()
+            if not charged:
+                self.event("payment", f"not charged (confirmed by hand): {payment.describe()}")
+                return True
+        self.record_payment(url, 200, {}, payment)
+        return True
+
+    def record_payment(self, url: str, status: int, headers, payment: Payment | None, sent: dict | None = None) -> None:
         """After a response: remember 402 payment options, and count a payment that went through."""
         if status == 402:
             quotes = payments.parse_quote(headers, None)
@@ -283,8 +416,16 @@ class _Run:
         with self.lock:
             r = self.report
             if not (payments.settled(headers) or 200 <= status < 300):
-                self.event("payment", f"not charged (HTTP {status}): {payment.describe()}")
+                # After a lost answer, a refusal (often "already used") doesn't prove the first send wasn't charged.
+                if sent and sent["answer_lost"]:
+                    self.mark_unconfirmed(url, payment, sent, f"HTTP {status} after a lost answer")
+                else:
+                    self.event("payment", f"not charged (HTTP {status}): {payment.describe()}")
                 return
+            if sent and sent["resend"] and self.unconfirmed.pop(sent["signature"], None):
+                if payment.amount_usd is not None:
+                    r.unconfirmed_usd -= payment.amount_usd
+                self._sync_unconfirmed()
             r.payments += 1
             host = urlsplit(url).hostname or "?"
             usd = payment.amount_usd
@@ -439,6 +580,9 @@ class Guard:
         pay_safe_fail_closed: bool = False,
         pay_safe_url: str = payments.PAY_SAFE_URL,
         pay_safe_timeout: float = 8.0,
+        lost_answer_retries: int = 2,
+        lost_answer_retry_delay: float = 1.0,
+        block_new_payment_while_unconfirmed: bool = True,
     ):
         """
         Args:
@@ -473,6 +617,14 @@ class Guard:
             pay_safe_fail_closed: Block payments when Pay Safe can't be reached (default: let them through).
             pay_safe_url: The Pay Safe endpoint.
             pay_safe_timeout: Seconds to wait for Pay Safe.
+            lost_answer_retries: When a signed x402 payment gets no answer (network error, timeout, or a
+                502/503/504/52x gateway error) the seller may still have settled it. The guard then resends
+                the SAME signed payment, which can be settled at most once, up to this many times. It never
+                signs a new one.
+            lost_answer_retry_delay: Seconds to wait before each resend, times the attempt number.
+            block_new_payment_while_unconfirmed: While a payment is unconfirmed, block a NEW signed payment
+                for the same request (it could pay twice). Resending the same one is always allowed. Clear it
+                with ``guard.resolve_unconfirmed()``.
         """
         if on_rate_limit not in ("wait", "stop"):
             raise ValueError('on_rate_limit must be "wait" or "stop"')
@@ -503,6 +655,9 @@ class Guard:
         self.pay_safe_fail_closed = pay_safe_fail_closed
         self.pay_safe_url = pay_safe_url
         self.pay_safe_timeout = pay_safe_timeout
+        self.lost_answer_retries = lost_answer_retries
+        self.lost_answer_retry_delay = lost_answer_retry_delay
+        self.block_new_payment_while_unconfirmed = block_new_payment_while_unconfirmed
         self.last_report: RunReport | None = None
         self._runs: set[_Run] = set()
         self._runs_lock = threading.Lock()
@@ -578,6 +733,13 @@ class Guard:
             return
         payload = json.dumps(details, sort_keys=True, default=repr).encode()
         run.admit("action", "", action, payload)
+
+    def resolve_unconfirmed(self, url: str, charged: bool, method: str = "GET") -> bool:
+        """Settle an unconfirmed payment of the current run once you know (from your wallet or a block explorer)
+        whether it was charged: ``charged=True`` counts it as paid, False gives it back to the budget. Returns
+        False when nothing matches (or outside a guarded run)."""
+        run = _state.current_run()
+        return run.resolve_unconfirmed(url, charged, method) if run is not None else False
 
     def add_cost(self, usd: float, note: str = "") -> None:
         """Add a cost the guard can't see (e.g. a paid API it doesn't parse, or a streamed response)."""

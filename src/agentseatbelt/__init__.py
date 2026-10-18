@@ -21,7 +21,7 @@ from .guard import Guard, GuardResult
 from .pricing import DEFAULT_PRICES
 from .report import Event, RunReport
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Guard",

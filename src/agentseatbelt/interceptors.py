@@ -60,6 +60,17 @@ def _patch_httpx(module_name: str) -> None:
         except httpx.RequestNotRead:
             return b""
 
+    # A lost answer is resent only when the body can be sent again (bytes, not a one-shot stream).
+    byte_stream = getattr(httpx, "ByteStream", None)
+
+    def can_resend(request) -> bool:
+        return byte_stream is not None and isinstance(request.stream, byte_stream)
+
+    lost = httpx.TransportError  # connect/read errors and timeouts
+
+    async def aclose(response) -> None:
+        await response.aclose()
+
     original_send = httpx.Client.send
 
     @functools.wraps(original_send)
@@ -73,11 +84,16 @@ def _patch_httpx(module_name: str) -> None:
         payment = run.check_payment(request.method, url, request.headers)
         if payment is not None:
             request.extensions[CHECKED] = True
-        response = original_send(self, request, *args, **kwargs)
+            response = run.send_payment(
+                request.method, url, request.headers, payment, lambda: original_send(self, request, *args, **kwargs),
+                lost, can_resend(request), lambda r: r.close(),
+            )
+        else:
+            response = original_send(self, request, *args, **kwargs)
         streamed = bool(kwargs.get("stream", False))
         run.record_response(
             url, body, response.headers.get("content-type", ""), None if streamed else response.content, streamed,
-            response.status_code, response.headers, payment,
+            response.status_code, response.headers,
         )
         return response
 
@@ -97,11 +113,17 @@ def _patch_httpx(module_name: str) -> None:
             check = functools.partial(run.check_payment, request.method, url, request.headers)
             payment = await asyncio.to_thread(check) if run.guard.pay_safe else check()
             request.extensions[CHECKED] = True
-        response = await original_async_send(self, request, *args, **kwargs)
+        if payment is not None:
+            response = await run.asend_payment(
+                request.method, url, request.headers, payment, lambda: original_async_send(self, request, *args, **kwargs),
+                lost, can_resend(request), aclose,
+            )
+        else:
+            response = await original_async_send(self, request, *args, **kwargs)
         streamed = bool(kwargs.get("stream", False))
         run.record_response(
             url, body, response.headers.get("content-type", ""), None if streamed else response.content, streamed,
-            response.status_code, response.headers, payment,
+            response.status_code, response.headers,
         )
         return response
 
@@ -131,10 +153,14 @@ def _patch_httpx(module_name: str) -> None:
         if run is None:
             return original_handle(self, request)
         payment = run.check_payment(request.method, str(request.url), request.headers) if needs_check(run, request) else None
-        response = original_handle(self, request)
-        remember_quote(run, request, response, response.read() if v1_quote_body(response) else None)
         if payment is not None:
-            run.record_payment(str(request.url), response.status_code, response.headers, payment)
+            response = run.send_payment(
+                request.method, str(request.url), request.headers, payment, lambda: original_handle(self, request),
+                lost, can_resend(request), lambda r: r.close(),
+            )
+        else:
+            response = original_handle(self, request)
+        remember_quote(run, request, response, response.read() if v1_quote_body(response) else None)
         return response
 
     original_async_handle = httpx.AsyncHTTPTransport.handle_async_request
@@ -148,10 +174,14 @@ def _patch_httpx(module_name: str) -> None:
         if needs_check(run, request):
             check = functools.partial(run.check_payment, request.method, str(request.url), request.headers)
             payment = await asyncio.to_thread(check) if run.guard.pay_safe else check()
-        response = await original_async_handle(self, request)
-        remember_quote(run, request, response, await response.aread() if v1_quote_body(response) else None)
         if payment is not None:
-            run.record_payment(str(request.url), response.status_code, response.headers, payment)
+            response = await run.asend_payment(
+                request.method, str(request.url), request.headers, payment, lambda: original_async_handle(self, request),
+                lost, can_resend(request), aclose,
+            )
+        else:
+            response = await original_async_handle(self, request)
+        remember_quote(run, request, response, await response.aread() if v1_quote_body(response) else None)
         return response
 
     httpx.HTTPTransport.handle_request = handle_request
@@ -163,6 +193,12 @@ def _patch_requests() -> None:
         import requests
     except ImportError:
         return
+
+    # Connection resets, timeouts and cut-off answers: the payment may have been settled anyway.
+    lost = (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError)
+
+    def can_resend(request) -> bool:
+        return request.body is None or isinstance(request.body, (bytes, str))
 
     original_send = requests.Session.send
 
@@ -177,11 +213,16 @@ def _patch_requests() -> None:
         payment = run.check_payment(request.method or "GET", url, request.headers)
         if payment is not None:
             setattr(request, CHECKED, True)
-        response = original_send(self, request, **kwargs)
+            response = run.send_payment(
+                request.method or "GET", url, request.headers, payment, lambda: original_send(self, request, **kwargs),
+                lost, can_resend(request), lambda r: r.close(),
+            )
+        else:
+            response = original_send(self, request, **kwargs)
         streamed = bool(kwargs.get("stream", False))
         run.record_response(
             url, body, response.headers.get("content-type", ""), None if streamed else response.content, streamed,
-            response.status_code, response.headers, payment,
+            response.status_code, response.headers,
         )
         return response
 
@@ -198,13 +239,17 @@ def _patch_requests() -> None:
         payment = None
         if not getattr(request, CHECKED, False) and has_payment(request.headers):
             payment = run.check_payment(request.method or "GET", request.url, request.headers)
-        response = original_adapter_send(self, request, *args, **kwargs)
+        if payment is not None:
+            response = run.send_payment(
+                request.method or "GET", request.url, request.headers, payment,
+                lambda: original_adapter_send(self, request, *args, **kwargs), lost, can_resend(request), lambda r: r.close(),
+            )
+        else:
+            response = original_adapter_send(self, request, *args, **kwargs)
         if response.status_code == 402:
             stream = kwargs.get("stream", args[0] if args else False)
             body = None if stream or response.headers.get("payment-required") else response.content
             run.record_response(request.url, b"", response.headers.get("content-type", ""), body, False, 402, response.headers)
-        if payment is not None:
-            run.record_payment(request.url, response.status_code, response.headers, payment)
         return response
 
     requests.adapters.HTTPAdapter.send = adapter_send
