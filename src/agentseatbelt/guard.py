@@ -130,11 +130,14 @@ class _Run:
     def _raise_stop(self, exc: GuardStop):
         raise self.mark_stop(exc, kill=False).with_traceback(None)
 
-    def _check_limits(self) -> None:
-        g = self.guard
+    def _check_stopped(self) -> None:
         if self.stopped is not None:
             self.needs_kill = False  # the stop is being raised right here; no need to interrupt as well
             raise self.stopped.with_traceback(None)
+
+    def _check_limits(self) -> None:
+        g = self.guard
+        self._check_stopped()
         if g.kill_file and os.path.exists(g.kill_file):
             self._raise_stop(EmergencyStop(f"Kill file found: {g.kill_file}"))
         if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -231,6 +234,7 @@ class _Run:
             payment = payments.parse_payment(headers, self.quotes.get(url))
             if payment is None:
                 return None
+            self._check_stopped()
             # The same signed payment sent again after a lost answer is already counted: it can't be charged twice.
             key = f"{method.upper()} {url}"
             earlier = self.unconfirmed.get(payments.payment_header(headers) or "")
@@ -258,6 +262,8 @@ class _Run:
                 )
         if g.pay_safe:
             self._pay_safe(method, url, payment)
+            with self.lock:  # a stop may have come while Pay Safe was answering
+                self._check_stopped()
         return payment
 
     def _pay_safe(self, method: str, url: str, payment: Payment) -> None:
@@ -302,6 +308,20 @@ class _Run:
             self.event("resend", f"{why}; resending the same signed payment ({attempt + 1}/{retries}): {payment.describe()}")
         return self.guard.lost_answer_retry_delay * (attempt + 1)
 
+    def _wait_to_resend(self, payment: Payment, sent: dict, why: str, attempt: int, retries: int) -> bool:
+        """True if the same signed payment should go out again. After a stop, nothing more leaves."""
+        if attempt >= retries or self.stopped is not None:
+            return False
+        time.sleep(self._resending(payment, sent, why, attempt, retries))
+        return self.stopped is None
+
+    async def _await_to_resend(self, payment: Payment, sent: dict, why: str, attempt: int, retries: int) -> bool:
+        """``_wait_to_resend`` for async code."""
+        if attempt >= retries or self.stopped is not None:
+            return False
+        await asyncio.sleep(self._resending(payment, sent, why, attempt, retries))
+        return self.stopped is None
+
     def _sync_unconfirmed(self) -> None:
         self.report.unconfirmed = [
             {"url": e["url"], "method": e["method"], "amount_usd": e["payment"].amount_usd,
@@ -335,56 +355,68 @@ class _Run:
         sent = self._sent(method, url, headers)
         retries = max(0, self.guard.lost_answer_retries) if can_resend else 0
         attempt = 0
-        while True:
-            try:
-                response = send()
-            except network_errors as e:
-                why = f"no answer ({type(e).__name__})"
-                if attempt < retries:
-                    time.sleep(self._resending(payment, sent, why, attempt, retries))
-                    attempt += 1
-                    continue
-                self.mark_unconfirmed(url, payment, sent, why)
-                raise
-            if self._lost(response):
-                if attempt < retries:
-                    if close:
-                        close(response)
-                    time.sleep(self._resending(payment, sent, f"HTTP {response.status_code}", attempt, retries))
-                    attempt += 1
-                    continue
-                self.mark_unconfirmed(url, payment, sent, f"HTTP {response.status_code}")
+        try:
+            while True:
+                try:
+                    response = send()
+                except network_errors as e:
+                    why = f"no answer ({type(e).__name__})"
+                    if self._wait_to_resend(payment, sent, why, attempt, retries):
+                        attempt += 1
+                        continue
+                    self.mark_unconfirmed(url, payment, sent, why)
+                    raise
+                if self._lost(response):
+                    why = f"HTTP {response.status_code}"
+                    if self._wait_to_resend(payment, sent, why, attempt, retries):
+                        if close:
+                            close(response)
+                        attempt += 1
+                        continue
+                    self.mark_unconfirmed(url, payment, sent, why)
+                    return response
+                self.record_payment(url, response.status_code, response.headers, payment, sent)
+                sent["counted"] = True
                 return response
-            self.record_payment(url, response.status_code, response.headers, payment, sent)
-            return response
+        except (GuardStop, KeyboardInterrupt):
+            # Interrupted after the payment may have left: it must stay counted.
+            if not sent.get("counted"):
+                self.mark_unconfirmed(url, payment, sent, "interrupted before its answer came")
+            raise
 
     async def asend_payment(self, method: str, url: str, headers, payment: Payment, send, network_errors, can_resend: bool, close=None):
         """``send_payment`` for async code: ``send`` returns an awaitable, ``close`` may too."""
         sent = self._sent(method, url, headers)
         retries = max(0, self.guard.lost_answer_retries) if can_resend else 0
         attempt = 0
-        while True:
-            try:
-                response = await send()
-            except network_errors as e:
-                why = f"no answer ({type(e).__name__})"
-                if attempt < retries:
-                    await asyncio.sleep(self._resending(payment, sent, why, attempt, retries))
-                    attempt += 1
-                    continue
-                self.mark_unconfirmed(url, payment, sent, why)
-                raise
-            if self._lost(response):
-                if attempt < retries:
-                    if close:
-                        await close(response)
-                    await asyncio.sleep(self._resending(payment, sent, f"HTTP {response.status_code}", attempt, retries))
-                    attempt += 1
-                    continue
-                self.mark_unconfirmed(url, payment, sent, f"HTTP {response.status_code}")
+        try:
+            while True:
+                try:
+                    response = await send()
+                except network_errors as e:
+                    why = f"no answer ({type(e).__name__})"
+                    if await self._await_to_resend(payment, sent, why, attempt, retries):
+                        attempt += 1
+                        continue
+                    self.mark_unconfirmed(url, payment, sent, why)
+                    raise
+                if self._lost(response):
+                    why = f"HTTP {response.status_code}"
+                    if await self._await_to_resend(payment, sent, why, attempt, retries):
+                        if close:
+                            await close(response)
+                        attempt += 1
+                        continue
+                    self.mark_unconfirmed(url, payment, sent, why)
+                    return response
+                self.record_payment(url, response.status_code, response.headers, payment, sent)
+                sent["counted"] = True
                 return response
-            self.record_payment(url, response.status_code, response.headers, payment, sent)
-            return response
+        except (GuardStop, asyncio.CancelledError, KeyboardInterrupt):
+            # Interrupted after the payment may have left: it must stay counted.
+            if not sent.get("counted"):
+                self.mark_unconfirmed(url, payment, sent, "interrupted before its answer came")
+            raise
 
     def resolve_unconfirmed(self, url: str, charged: bool, method: str = "GET") -> bool:
         key = f"{method.upper()} {url}"
@@ -427,6 +459,8 @@ class _Run:
                     r.unconfirmed_usd -= payment.amount_usd
                 self._sync_unconfirmed()
             r.payments += 1
+            if sent:
+                sent["counted"] = True
             host = urlsplit(url).hostname or "?"
             usd = payment.amount_usd
             if usd is None:

@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.1 (2026-11-04)
+
+Emergency stop: nothing further leaves after a stop, and a payment already sent stays counted.
+
+- A payment waiting on Pay Safe when the stop comes is no longer sent. It could still go out from a worker thread, or from async code with `hard_kill=False`.
+- Automatic resends of a lost payment now end at the stop in those setups too.
+- A payment interrupted before its answer came (by a stop, Ctrl-C or task cancellation) is now **unconfirmed** and counts against the budget. It used to be missing from the report, even with default settings.
+- README: new section on what emergency stop covers. Thanks to Chris Polaris for asking where the boundary is.
+
+## 0.3.0 (2026-10-18)
 
 Lost answers: resend the same signed payment, never sign a new one.
 
