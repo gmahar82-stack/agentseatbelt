@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentseatbelt"
-version = "0.3.0"
+version = "0.3.1"
 description = "A seatbelt for AI agents: budget caps, rate limits, time limits, loop detection, endpoint filters and x402 payment limits for any Python agent."
 readme = "README.md"
 license = "MIT"

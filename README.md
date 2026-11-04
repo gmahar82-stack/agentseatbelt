@@ -56,7 +56,7 @@ Outside a guarded run, nothing changes.
 | Loop detection | `loop_threshold=5` (default) | Stops when the identical request or action repeats 5 times within the last 20. |
 | Endpoint filter | `block_endpoints=[...]`, `allow_endpoints=[...]` | Blocked calls never leave your machine. |
 | Action filter | `block_actions=["delete_*"]` | For tool calls reported via `guard.checkpoint(...)`. |
-| Emergency stop | `guard.stop()` or `kill_file="STOP"` | Stop from another thread, or by creating a file. |
+| Emergency stop | `guard.stop()` or `kill_file="STOP"` | Stop from another thread, or by creating a file. See [What emergency stop covers](#what-emergency-stop-covers). |
 | Payment limits | `max_payment_usd=0.05`, `pay_safe=True` | x402 payments count toward the budget, capped per payment, optionally checked by Pay Safe. See [x402 payments](#x402-payments-agents-that-pay-for-apis). |
 | Cost report | `result.report` | Cost, tokens, models, payments, hosts, the reason it stopped, and the last 200 events. |
 
@@ -110,6 +110,16 @@ If a signed payment gets no answer (connection reset, timeout, or a 502/503/504/
 3. Once you know (from your wallet or a block explorer), call `guard.resolve_unconfirmed(url, charged=True/False)` inside the run.
 
 Streamed request bodies can't be resent, so those go straight to step 2. Thanks to MusedIn for pointing this case out.
+
+### What emergency stop covers
+
+| Payment | After `guard.stop()` |
+|---|---|
+| Not sent yet, including one waiting on Pay Safe | Blocked. It never leaves your machine. |
+| Sent, answer lost | No more resends. It stays **unconfirmed** and keeps counting against the budget. |
+| Already sent | Can't be recalled. The seller may still collect it, and the seatbelt keeps counting it. |
+
+Stop means nothing further leaves your machine. It can't undo what already left, so after a stop, check your wallet for any unconfirmed payment.
 
 ### Pay Safe (optional, off by default)
 

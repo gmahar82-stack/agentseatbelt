@@ -6,16 +6,19 @@ for the same request, and keep counting the amount against the budget until it's
 
 import asyncio
 import base64
+import contextlib
+import contextvars
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 import requests
 
-from agentseatbelt import Guard, PaymentBlocked
+from agentseatbelt import Guard, PaymentBlocked, payments
 
 USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 SELLER = "0x1111111111111111111111111111111111111111"
@@ -275,3 +278,136 @@ def test_official_async_httpx_client_dropped_connection_pays_once(dropping_selle
     assert result.output == 200
     assert len(sigs) == 2 and sigs[0] == sigs[1]
     assert result.report.payments == 1 and result.report.payments_usd == pytest.approx(0.01)
+
+
+# ---- emergency stop: nothing further leaves, and a payment already sent stays counted ---------------------
+
+
+def stop_in_worker(g: Guard, work, stop_after: float = 0.1) -> None:
+    """Run `work` in a thread of its own, as many agents do, so the stop can't interrupt it."""
+    ctx = contextvars.copy_context()
+    errors = []
+
+    def body():
+        try:
+            work()
+        except BaseException as e:
+            errors.append(e)
+
+    worker = threading.Thread(target=lambda: ctx.run(body))
+    worker.start()
+    threading.Timer(stop_after, g.stop).start()
+    worker.join()
+
+
+def test_stop_during_resend_wait_sends_nothing_more_and_stays_counted():
+    seller = FlakySeller(drops=100)
+    client = httpx.Client(transport=httpx.MockTransport(seller))
+    g = Guard(loop_threshold=None, lost_answer_retries=2, lost_answer_retry_delay=0.4)
+
+    def agent():
+        threading.Timer(0.1, g.stop).start()
+        client.get(URL, headers=signed("0xONE"))
+
+    r = g.run(agent).report
+    assert r.stop_reason == "emergency_stop"
+    assert len(seller.sends) == 1
+    assert r.unconfirmed_usd == pytest.approx(0.01) and len(r.unconfirmed) == 1 and r.payments == 0
+
+
+def test_stop_during_resend_wait_in_a_worker_thread():
+    seller = FlakySeller(drops=100)
+    client = httpx.Client(transport=httpx.MockTransport(seller))
+    g = Guard(loop_threshold=None, lost_answer_retries=2, lost_answer_retry_delay=0.4)
+    r = g.run(lambda: stop_in_worker(g, lambda: client.get(URL, headers=signed("0xONE")))).report
+    assert len(seller.sends) == 1
+    assert r.unconfirmed_usd == pytest.approx(0.01)
+
+
+@pytest.mark.parametrize("hard_kill", [True, False])
+def test_async_stop_during_resend_wait(hard_kill):
+    seller = FlakySeller(drops=100)
+    g = Guard(loop_threshold=None, lost_answer_retries=2, lost_answer_retry_delay=0.4, hard_kill=hard_kill)
+
+    async def agent():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(seller)) as client:
+            asyncio.get_running_loop().call_later(0.1, g.stop)
+            with contextlib.suppress(httpx.ReadError):
+                await client.get(URL, headers=signed("0xONE"))
+
+    r = asyncio.run(g.arun(agent)).report
+    assert len(seller.sends) == 1
+    assert r.unconfirmed_usd == pytest.approx(0.01)
+
+
+def test_stop_after_a_gateway_error_leaves_the_answer_readable():
+    seller = FlakySeller(drops=100, drop_status=504)
+    client = httpx.Client(transport=httpx.MockTransport(seller))
+    g = Guard(loop_threshold=None, lost_answer_retries=2, lost_answer_retry_delay=0.4)
+    out = {}
+
+    def work():
+        out["status"] = client.get(URL, headers=signed("0xONE")).status_code
+
+    r = g.run(lambda: stop_in_worker(g, work)).report
+    assert out["status"] == 504 and len(seller.sends) == 1
+    assert r.unconfirmed_usd == pytest.approx(0.01)
+
+
+def test_after_stop_the_same_signed_payment_is_refused():
+    seller = FlakySeller(drops=100)
+    client = httpx.Client(transport=httpx.MockTransport(seller))
+    g = Guard(loop_threshold=None, lost_answer_retries=0)
+
+    def agent():
+        with pytest.raises(httpx.ReadError):
+            client.get(URL, headers=signed("0xONE"))
+        g.stop()
+        client.get(URL, headers=signed("0xONE"))
+
+    r = g.run(agent).report
+    assert len(seller.sends) == 1
+    assert r.unconfirmed_usd == pytest.approx(0.01)
+
+
+def slow_pay_safe(*args, **kwargs):
+    time.sleep(0.4)
+    return {"verdict": "go", "summary": "ok"}
+
+
+def test_stop_while_pay_safe_answers_in_a_worker_thread_never_sends(monkeypatch):
+    monkeypatch.setattr(payments, "pay_safe", slow_pay_safe)
+    seller = FlakySeller(drops=0)
+    client = httpx.Client(transport=httpx.MockTransport(seller))
+    g = Guard(loop_threshold=None, pay_safe=True)
+    g.run(lambda: stop_in_worker(g, lambda: client.get(URL, headers=signed("0xONE"))))
+    assert seller.sends == []
+
+
+def test_async_stop_while_pay_safe_answers_never_sends(monkeypatch):
+    monkeypatch.setattr(payments, "pay_safe", slow_pay_safe)
+    seller = FlakySeller(drops=0)
+    g = Guard(loop_threshold=None, pay_safe=True, hard_kill=False)
+
+    async def agent():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(seller)) as client:
+            threading.Timer(0.1, g.stop).start()
+            await client.get(URL, headers=signed("0xONE"))
+
+    asyncio.run(g.arun(agent))
+    assert seller.sends == []
+
+
+def test_a_stop_after_the_answer_does_not_count_the_payment_twice():
+    seller = FlakySeller(drops=0)
+    client = httpx.Client(transport=httpx.MockTransport(seller))
+    g = Guard(loop_threshold=None)
+
+    def agent():
+        client.get(URL, headers=signed("0xONE"))
+        g.stop()
+        client.get("https://paid.example.com/free")
+
+    r = g.run(agent).report
+    assert r.payments == 1 and r.payments_usd == pytest.approx(0.01)
+    assert r.unconfirmed_usd == 0 and r.unconfirmed == []
