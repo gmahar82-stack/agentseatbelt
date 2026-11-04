@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.3.1 (2026-11-04)
 
 Emergency stop: nothing further leaves after a stop, and a payment already sent stays counted.
 
